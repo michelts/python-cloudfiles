@@ -13,6 +13,7 @@ from fakehttp          import CustomHTTPConnection
 from misc              import printdoc
 from tempfile          import mktemp
 import os
+import time
 from StringIO import StringIO
 
 
@@ -88,6 +89,13 @@ class ObjectTest(unittest.TestCase):
         self.storage_object.size = 21
         self.storage_object.content_type = "text/plain"
         self.storage_object.send(gener)
+
+    @printdoc
+    def test_send_with_inactivity(self):
+        """Simulates an inactivity timeout between two send requests."""
+        self.test_send()
+        time.sleep(20)
+        self.test_send() # this send should not fail
 
     @printdoc
     def test_sync_metadata(self):

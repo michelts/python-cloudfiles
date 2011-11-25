@@ -21,9 +21,11 @@ from errors  import ResponseError, NoSuchObject, \
                     InvalidObjectName, IncompleteSend, \
                     InvalidMetaName, InvalidMetaValue
 
-from socket  import timeout
+import socket
 import consts
+import ssl
 from utils   import unicode_quote, requires_name
+import itertools
 
 # Because HTTPResponse objects *have* to have read() called on them
 # before they can be used again ...
@@ -352,7 +354,7 @@ class Object(object):
                     callback(transfered, self.size)
             response = http.getresponse()
             buff = response.read()
-        except timeout, err:
+        except socket.timeout, err:
             if response:
                 # pylint: disable-msg=E1101
                 buff = response.read()
@@ -430,7 +432,7 @@ class Object(object):
                 self._etag = hdr[1]
 
     @requires_name(InvalidObjectName)
-    def send(self, iterable):
+    def send(self, base_iterable, retry=True):
         """
         Write potentially transient data to the remote storage system using a
         generator or stream.
@@ -456,10 +458,16 @@ class Object(object):
         >>> pfd = os.popen('tar -czvf - ./data/', 'r')
         >>> test_object.send(pfd)
 
-        @param iterable: stream or generator which yields the content to upload
+        @param base_iterable: stream or generator which yields the content to upload
         @type iterable: generator or stream
+
+        @param retry: control if there should be a request retry on fails
+        @type retry: boolean
         """
         self._name_check()
+
+        # to retry a request, we must get the iterable copied
+        iterable, iterable_backup = itertools.tee(base_iterable)
 
         if isinstance(iterable, basestring):
             # use write to buffer the string and avoid sending it 1 byte at a time
@@ -490,6 +498,7 @@ class Object(object):
             headers['Transfer-Encoding'] = 'chunked'
         headers['X-Auth-Token'] = self.container.conn.token
         headers['User-Agent'] = self.container.conn.user_agent
+
         http = self.container.conn.connection
         http.putrequest('PUT', path)
         for key, value in headers.iteritems():
@@ -500,21 +509,41 @@ class Object(object):
         transferred = 0
         try:
             for chunk in iterable:
-                if self.size is None:
-                    http.send("%X\r\n" % len(chunk))
-                    http.send(chunk)
-                    http.send("\r\n")
-                else:
-                    http.send(chunk)
+                try:
+                    if self.size is None:
+                        http.send("%X\r\n" % len(chunk))
+                        http.send(chunk)
+                        http.send("\r\n")
+                    else:
+                        http.send(chunk)
+                except (socket.error, IOError), e:
+                    # the http connection was lost and must be restarted. As
+                    # the send can't be rewinded, retry the send once using the
+                    # iterable backup. 
+                    if retry:
+                        return self.send(iterable_backup, retry=False)
+                    else:
+                        raise e
                 transferred += len(chunk)
             if self.size is None:
                 http.send("0\r\n\r\n")
             # If the generator didn't yield enough data, stop, drop, and roll.
             elif transferred < self.size:
                 raise IncompleteSend()
-            response = http.getresponse()
+            try:
+                response = http.getresponse()
+            except ssl.SSLError, e:
+                # the send reached the timeout limit, this could be raised by a
+                # too large file or by a temporary network oscilation so,
+                # retry the send once using the iterable backup. In this case
+                # the connection must be reseted before retry
+                if retry:
+                    self.container.conn.http_connect()
+                    return self.send(iterable_backup, retry=False)
+                else:
+                    raise e
             buff = response.read()
-        except timeout, err:
+        except socket.timeout, err:
             if response:
                 # pylint: disable-msg=E1101
                 response.read()
